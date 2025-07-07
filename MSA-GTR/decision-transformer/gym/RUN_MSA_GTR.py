@@ -10,10 +10,6 @@ import sys
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-
-# Removed invalid shell command. If needed, set PYTHONPATH in your shell before running this script.
 
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode, evaluate_episode_rtg
@@ -22,6 +18,53 @@ from decision_transformer.models.mlp_bc import MLPBCModel
 from decision_transformer.training.act_trainer import ActTrainer
 from decision_transformer.training.seq_trainer import SequenceTrainer
 
+def split_trajectories(data):
+    """
+    Split concatenated trajectory data into individual trajectories for Decision Transformer
+    """
+    observations = data['observations']
+    actions = data['actions']
+    rewards = data['rewards']
+    terminals = data['terminals']
+    timeouts = data['timeouts']
+    
+    trajectories = []
+    start_idx = 0
+    
+    # Find episode boundaries (where terminal or timeout is True)
+    episode_ends = np.where(terminals | timeouts)[0]
+    
+    for end_idx in episode_ends:
+        # Extract trajectory data
+        traj_obs = observations[start_idx:end_idx+1]
+        traj_actions = actions[start_idx:end_idx]  # Actions are one step shorter
+        traj_rewards = rewards[start_idx:end_idx]
+        
+        # Calculate returns-to-go (cumulative future rewards from each step)
+        returns_to_go = []
+        cumulative_return = 0
+        for i in range(len(traj_rewards)-1, -1, -1):
+            cumulative_return += traj_rewards[i]
+            returns_to_go.append(cumulative_return)
+        returns_to_go = np.array(returns_to_go[::-1])  # Reverse to get forward order
+        
+        # Create timesteps
+        timesteps = np.arange(len(traj_actions))
+        
+        trajectory = {
+            'observations': traj_obs[:-1],  # Remove last obs (no corresponding action)
+            'actions': traj_actions,
+            'rewards': traj_rewards,
+            'returns_to_go': returns_to_go,
+            'timesteps': timesteps,
+            'trajectory_length': len(traj_actions)
+        }
+        
+        trajectories.append(trajectory)
+        start_idx = end_idx + 1
+    
+    return trajectories
+
 
 def discount_cumsum(x, gamma):
     discount_cumsum = np.zeros_like(x)
@@ -29,6 +72,18 @@ def discount_cumsum(x, gamma):
     for t in reversed(range(x.shape[0]-1)):
         discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1]
     return discount_cumsum
+
+ def get_max_rtg(trajectories):
+        """
+        Compute the maximum return-to-go (RTG) from a list of trajectories.
+        """
+        max_rtg = 0
+        for traj in trajectories:
+            if 'returns_to_go' in traj:
+                rtg = traj['returns_to_go']
+                if len(rtg) > 0:
+                    max_rtg = max(max_rtg, np.max(rtg))
+        return max_rtg    
 
 
 def experiment(
@@ -43,27 +98,11 @@ def experiment(
     group_name = f'{exp_prefix}-{env_name}-{dataset}'
     exp_prefix = f'{group_name}-{random.randint(int(1e5), int(1e6) - 1)}'
 
-    if env_name == 'hopper':
+    if env_name == '':
         env = gym.make('Hopper-v3')
-        max_ep_len = 1000
+        max_ep_len = 100
         env_targets = [3600, 1800]  # evaluation conditioning targets
         scale = 1000.  # normalization for rewards/returns
-    elif env_name == 'halfcheetah':
-        env = gym.make('HalfCheetah-v3')
-        max_ep_len = 1000
-        env_targets = [12000, 6000]
-        scale = 1000.
-    elif env_name == 'walker2d':
-        env = gym.make('Walker2d-v3')
-        max_ep_len = 1000
-        env_targets = [5000, 2500]
-        scale = 1000.
-    elif env_name == 'reacher2d':
-        from decision_transformer.envs.reacher_2d import Reacher2dEnv
-        env = Reacher2dEnv()
-        max_ep_len = 100
-        env_targets = [76, 40]
-        scale = 10.
     else:
         raise NotImplementedError
 
@@ -74,9 +113,27 @@ def experiment(
     act_dim = env.action_space.shape[0]
 
     # load dataset
-    dataset_path = f'data/{env_name}-{dataset}-v2.pkl'
+    dataset_path = variant.get('dataset_path', None)
+
     with open(dataset_path, 'rb') as f:
-        trajectories = pickle.load(f)
+        concatenated_trajs = pickle.load(f)
+    
+
+    pyn_trajs= concatenated_trajs.item()
+
+    # split concatenated trajectories into individual trajectories
+    trajectories= split_trajectories(pyn_trajs)
+
+   
+
+    max_rtg = get_max_rtg(trajectories)
+    max_rtg_multiple = variant.get('MAX_RTG_MULTIPLE', 1.0)
+    max_rtg = max_rtg * max_rtg_multiple
+
+    
+
+    
+
 
     # save all path information into separate lists
     mode = variant.get('mode', 'normal')
@@ -290,7 +347,11 @@ def experiment(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='hopper')
+
+    parser.add_argument('--env', type=str, default='MSAGTR')
+    parser.add_argument('--MAX_RTG_MULTIPLE', type=float, default=1.0, help='Maximum RTG multiple for scaling returns-to-go')
+    parser.add_argument('--dataset_path', type=str, default=None, help='Path to the dataset .pkl file (overrides default if set)')
+
     parser.add_argument('--dataset', type=str, default='medium')  # medium, medium-replay, medium-expert, expert
     parser.add_argument('--mode', type=str, default='normal')  # normal for standard setting, delayed for sparse
     parser.add_argument('--K', type=int, default=20)
@@ -302,12 +363,12 @@ if __name__ == '__main__':
     parser.add_argument('--n_head', type=int, default=1)
     parser.add_argument('--activation_function', type=str, default='relu')
     parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', '-wd', type=float, default=1e-4)
-    parser.add_argument('--warmup_steps', type=int, default=10000)
+    parser.add_argument('--learning_rate', '-lr', type=float, default=1e-6)
+    parser.add_argument('--weight_decay', '-wd', type=float, default=1e-6)
+    parser.add_argument('--warmup_steps', type=int, default=10)
     parser.add_argument('--num_eval_episodes', type=int, default=100)
     parser.add_argument('--max_iters', type=int, default=10)
-    parser.add_argument('--num_steps_per_iter', type=int, default=10000)
+    parser.add_argument('--num_steps_per_iter', type=int, default=10)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--log_to_wandb', '-w', type=bool, default=False)
 
